@@ -53,7 +53,7 @@ breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_result
 3. `bucket_mgr.list_all(include_archive=False)` — 遍历 `permanent/` + `dynamic/` + `feel/` 目录，加载所有 `.md` 文件的 frontmatter + 正文
 4. 筛选钉选桶（`pinned=True` 或 `protected=True`）
 5. 筛选未解决桶（`resolved=False`，排除 `permanent/feel/pinned`）
-6. **冷启动检测**：找 `activation_count==0 && importance>=8` 的桶，最多取 2 个插入排序最前
+6. **冷启动检测**：找 `activation_count==0 && importance>=8` 的桶，最多取 2 个插入排序最前（**决策：`create()` 初始化应为 0，区分"创建"与"被主动召回"，见 B-04**）
 7. 按 `decay_engine.calculate_score(metadata)` 降序排列剩余未解决桶
 8. 对 top-20 以外随机洗牌（top-1 固定，2~20 随机）
 9. 截断到 `max_results` 条
@@ -130,7 +130,7 @@ hold(content="用户拿到实习 offer，情绪激动", importance=7)
 - `generate_bucket_id()` → `uuid4().hex[:12]`
 - `sanitize_name(name)` → 正则清洗，最长 80 字符
 - 写 YAML frontmatter + 正文到 `safe_path(domain_dir, f"{name}_{id}.md")`
-- frontmatter 字段：`id, name, tags, domain, valence, arousal, importance, type, created, last_active, activation_count=1`
+- frontmatter 字段：`id, name, tags, domain, valence, arousal, importance, type, created, last_active, activation_count=0`（**决策：初始为 0，`touch()` 首次被召回后变为 1**）
 
 ---
 
@@ -187,8 +187,9 @@ breath(query="实习", domain="成长", valence=0.7, arousal=0.5)
      - `_calc_time_score()`: `e^(-0.02×days_since_last_active)`，0~1
      - `importance_score`: `importance / 10`
      - `total = topic×4 + emotion×2 + time×1.5 + importance×1`，归一化到 0~100
-     - `resolved` 桶降权 ×0.3
-     - 过滤 `score >= fuzzy_threshold`（默认 50），返回最多 `limit` 条
+     - 过滤 `score >= fuzzy_threshold`（默认 50）
+     - 通过阈值后，`resolved` 桶仅在排序时降权 ×0.3（不影响是否被检出）
+     - 返回最多 `limit` 条
 5. 排除 pinned/protected 桶（它们在浮现模式展示）
 6. **向量补充通道**（server.py 额外层）：`embedding_engine.search_similar(query, top_k=20)` → 相似度 > 0.5 的桶补充到结果集（标记 `vector_match=True`）
 7. 对每个结果：
@@ -251,9 +252,11 @@ trace(bucket_id="abc123", resolved=1)
 
 **系统内部**：
 1. `resolved in (0, 1)` → `updates["resolved"] = True`
-2. `bucket_mgr.update("abc123", resolved=True)` → 读取 `.md` 文件，更新 frontmatter，写回
-3. 后续 `breath()` 浮现时：该桶 `decay_engine.calculate_score()` 乘以 `resolved_factor=0.05`（若同时 `digested=True` 则 ×0.02）
+2. `bucket_mgr.update("abc123", resolved=True)` → 读取 `.md` 文件，更新 frontmatter 中 `resolved=True`，写回，**桶留在原 `dynamic/` 目录，不移动**
+3. 后续 `breath()` 浮现时：该桶 `decay_engine.calculate_score()` 乘以 `resolved_factor=0.05`（若同时 `digested=True` 则 ×0.02），自然降权，最终由 decay 引擎在得分 < threshold 时归档
 4. `bucket_mgr.search()` 中该桶得分乘以 0.3 降权，但仍可被关键词激活
+
+> ⚠️ **代码 Bug B-01**：当前实现中 `update(resolved=True)` 会将桶**立即移入 `archive/`**，导致桶完全消失于所有搜索路径，与上述规格不符。需移除 `bucket_manager.py` `update()` 中 resolved → `_move_bucket(archive_dir)` 的自动归档逻辑。
 
 **返回**：`"已修改记忆桶 abc123: resolved=True → 已沉底，只在关键词触发时重新浮现"`
 
@@ -449,7 +452,7 @@ CREATE TABLE embeddings (
 | `decay_cycle` | `list_all()` 失败 | 返回 `{"checked":0, "archived":0, ..., "error": str(e)}`，不终止后台循环 |
 | `decay_cycle` | 单桶 `calculate_score()` 失败 | `logger.warning()`，跳过该桶继续 |
 | 所有 feel 操作 | `source_bucket` 不存在 | `logger.warning()` 记录，feel 桶本身仍成功创建 |
-| `dehydrator.dehydrate()` | API 不可用（`api_available=False`）| ⚠️ **无本地 fallback**，直接返回原始内容或抛出异常 |
+| `dehydrator.dehydrate()` / `analyze()` / `merge()` / `digest()` | API 不可用（`api_available=False`）| **直接向 MCP 调用端明确报错（`RuntimeError`）**，无本地降级。本地关键词提取质量不足以替代语义打标与合并，静默降级比报错更危险（可能产生错误分类记忆）。 |
 | `embedding_engine.search_similar()` | `enabled=False` | 直接返回 `[]`，调用方 fallback 到 keyword 搜索 |
 
 ---
@@ -578,17 +581,51 @@ feel 桶自身:
 
 ---
 
-## 五、⚠️ 待实现项汇总
+## 五、代码与规格差异汇总（审查版）
 
-以下功能在现有代码中**未找到对应实现**，标注如下：
+> 本节由完整源码审查生成（2026-04-21），记录原待实现项最终状态、新发现 Bug 及参数决策。
 
-| 编号 | 描述 | 涉及位置 |
-|------|------|---------|
-| ⚠️-1 | `dehydrator.dehydrate()` **无本地降级 fallback**。当 `api_available=False` 时代码路径缺失（与注释"API 不可用时自动降级到本地关键词提取"不符）。`dehydrate()` 方法直接假设 API 可用。 | `dehydrator.py` `dehydrate()` + `_api_dehydrate()` |
-| ⚠️-2 | `decay_engine.run_decay_cycle()` 中 `auto_resolved` 逻辑的具体实现被摘要省略（Lines 211-215），无法确认 `days_since` 的计算和 `bucket_mgr.update(resolved=True)` 调用是否完整存在。 | `decay_engine.py` Lines 211-220 |
-| ⚠️-3 | `breath()` 浮现模式对**已归档桶**的处理逻辑：`list_all(include_archive=False)` 已正确排除归档桶，但 feel 桶的 `feel/` 子目录是否在 `list_all()` 中被遍历，需核实 `bucket_manager.py` 的 `list_all()` 实现（Lines 623-645 已摘要）。 | `bucket_manager.py` `list_all()` |
-| ⚠️-4 | `_time_ripple()` 的 `activation_count` 使用浮点数累加（+0.3），但 `calculate_score()` 中 `activation_count = max(1, int(...))` 会截断小数。浮点增量实际上对 score 无效果（任何 < 1 的浮点增量在 int() 后丢失）。 | `bucket_manager.py` `_time_ripple()` + `decay_engine.py` `calculate_score()` |
-| ⚠️-5 | Dashboard 路由（`/api/buckets`, `/api/search`, `/api/network` 等）未有认证保护说明——auth 中间件 `_require_auth()` 的调用是否覆盖全部 `/api/*` 路由，在摘要版代码中无法确认。 | `server.py` Lines 1211+ |
+---
+
+### 5.1 原待实现项最终状态
+
+| 编号 | 原描述 | 状态 | 结论 |
+|------|--------|------|------|
+| ⚠️-1 | `dehydrate()` 无本地降级 fallback | **已确认为设计决策** | API 不可用时直接向 MCP 调用端报错（RuntimeError），不降级，见三、降级行为表 |
+| ⚠️-2 | `run_decay_cycle()` auto_resolved 实现存疑 | ✅ 已确认实现 | `decay_engine.py` 完整实现 imp≤4 + >30天 + 未解决 → `bucket_mgr.update(resolved=True)` |
+| ⚠️-3 | `list_all()` 是否遍历 `feel/` 子目录 | ✅ 已确认实现 | `list_all()` dirs 明确包含 `self.feel_dir`，递归遍历 |
+| ⚠️-4 | `_time_ripple()` 浮点增量被 `int()` 截断 | ❌ 已确认 Bug | 见 B-03，决策见下 |
+| ⚠️-5 | Dashboard `/api/*` 路由认证覆盖 | ✅ 已确认覆盖 | 所有 `/api/buckets`、`/api/search`、`/api/network`、`/api/bucket/{id}`、`/api/breath-debug` 均调用 `_require_auth(request)` |
+
+---
+
+### 5.2 新发现 Bug 及修复决策
+
+| 编号 | 场景 | 严重度 | 问题描述 | 决策 & 修复方案 |
+|------|------|--------|----------|----------------|
+| **B-01** | 场景7a | 高 | `bucket_mgr.update(resolved=True)` 当前会将桶立即移入 `archive/`（type="archived"），规格预期"降权留存、关键词可激活"。resolved 桶实质上立即从所有搜索路径消失。 | **修复**：移除 `bucket_manager.py` `update()` 中 `resolved → _move_bucket(archive_dir)` 的自动归档逻辑，仅更新 frontmatter `resolved=True`，由 decay 引擎自然衰减至 archive。 |
+| **B-03** | 全局 | 高 | `_time_ripple()` 对 `activation_count` 做浮点增量（+0.3），但 `calculate_score()` 中 `max(1, int(...))` 截断小数，增量丢失，时间涟漪对衰减分无实际效果。 | **修复**：`decay_engine.py` `calculate_score()` 中改为 `activation_count = max(1.0, float(metadata.get("activation_count", 1)))` |
+| **B-04** | 场景1 | 中 | `bucket_manager.create()` 初始化 `activation_count=1`，冷启动检测条件 `activation_count==0` 对所有正常创建的桶永不满足，高重要度新桶不被优先浮现。 | **决策：初始化改为 `activation_count=0`**。语义上"创建"≠"被召回"，`touch()` 首次命中后变为 1，冷启动检测自然生效。规格已更新（见场景1步骤6 & 场景3 create 详情）。 |
+| **B-05** | 场景5 | 中 | `bucket_manager.py` `_calc_time_score()` 实现 `e^(-0.1×days)`，规格为 `e^(-0.02×days)`，衰减速度快 5 倍，30天后时间分 ≈ 0.05（规格预期 ≈ 0.55），旧记忆时间维度近乎失效。 | **决策：保留规格值 `0.02`**。记忆系统中旧记忆应通过关键词仍可被唤醒，时间维度是辅助信号不是淘汰信号。修复：`_calc_time_score()` 改为 `return math.exp(-0.02 * days)` |
+| **B-06** | 场景5 | 中 | `bucket_manager.py` `w_time` 默认值为 `2.5`，规格为 `1.5`，叠加 B-05 会导致时间维度严重偏重近期记忆。 | **决策：保留规格值 `1.5`**。修复：`w_time = scoring.get("time_proximity", 1.5)` |
+| **B-07** | 场景5 | 中 | `bucket_manager.py` `content_weight` 默认值为 `3.0`，规格为 `1.0`（body×1）。正文权重过高导致合并检测（`search(content, limit=1)`）误判——内容相似但主题不同的桶被错误合并。 | **决策：保留规格值 `1.0`**。正文是辅助信号，主要靠 name/tags/domain 识别同话题桶。修复：`content_weight = scoring.get("content_weight", 1.0)` |
+| **B-08** | 场景8 | 低 | `run_decay_cycle()` 内 auto_resolve 后继续使用旧 `meta` 变量计算 score，`resolved_factor=0.05` 需等下一 cycle 才生效。 | **修复**：auto_resolve 成功后执行 `meta["resolved"] = True` 刷新本地 meta 变量。 |
+| **B-09** | 场景3 | 低 | `hold()` 非 feel 路径中，用户显式传入的 `valence`/`arousal` 被 `analyze()` 返回值完全覆盖。 | **修复**：若用户显式传入（`0 <= valence <= 1`），优先使用用户值，`analyze()` 结果作为 fallback。 |
+| **B-10** | 场景10 | 低 | feel 桶以 `domain=[]` 创建，但 `bucket_manager.create()` 中 `domain or ["未分类"]` 兜底写入 `["未分类"]`，数据不干净。 | **修复**：`create()` 中对 `bucket_type=="feel"` 单独处理，允许空 domain 直接写入。 |
+
+---
+
+### 5.3 已确认正常实现
+
+- `breath()` 浮现模式不调用 `touch()`，不重置衰减计时器
+- `feel` 桶 `calculate_score()` 返回固定 50.0，永不归档
+- `breath(domain="feel")` 独立通道，按 `created` 降序，不压缩展示原文
+- `decay_engine.calculate_score()` 短期（≤3天）/ 长期（>3天）权重分离公式
+- `urgency_boost`：`arousal > 0.7 && !resolved → ×1.5`
+- `dream()` 连接提示（best_sim > 0.5）+ 结晶提示（feel 相似度 > 0.7 × ≥2 个）
+- 所有 `/api/*` Dashboard 路由均受 `_require_auth` 保护
+- `trace(delete=True)` 同步调用 `embedding_engine.delete_embedding()`
+- `grow()` 单条失败 `try/except` 隔离，标注 `⚠️条目名`，其他条继续
 
 ---
 

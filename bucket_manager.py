@@ -88,9 +88,9 @@ class BucketManager:
         scoring = config.get("scoring_weights", {})
         self.w_topic = scoring.get("topic_relevance", 4.0)
         self.w_emotion = scoring.get("emotion_resonance", 2.0)
-        self.w_time = scoring.get("time_proximity", 2.5)
+        self.w_time = scoring.get("time_proximity", 1.5)
         self.w_importance = scoring.get("importance", 1.0)
-        self.content_weight = scoring.get("content_weight", 3.0)  # Added to allow better content-based matching during merge
+        self.content_weight = scoring.get("content_weight", 1.0)  # body×1, per spec
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
@@ -124,7 +124,11 @@ class BucketManager:
         """
         bucket_id = generate_bucket_id()
         bucket_name = sanitize_name(name) if name else bucket_id
-        domain = domain or ["未分类"]
+        # feel buckets are allowed to have empty domain; others default to ["未分类"]
+        if bucket_type == "feel":
+            domain = domain if domain is not None else []
+        else:
+            domain = domain or ["未分类"]
         tags = tags or []
         linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
 
@@ -145,7 +149,7 @@ class BucketManager:
             "type": bucket_type,
             "created": now_iso(),
             "last_active": now_iso(),
-            "activation_count": 1,
+            "activation_count": 0,
         }
         if pinned:
             metadata["pinned"] = True
@@ -292,19 +296,17 @@ class BucketManager:
             logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
             return False
 
-        # --- Auto-move: pinned → permanent/, resolved → archive/ ---
-        # --- 自动移动：钉选 → permanent/，已解决 → archive/ ---
+        # --- Auto-move: pinned → permanent/ ---
+        # --- 自动移动：钉选 → permanent/ ---
+        # NOTE: resolved buckets are NOT auto-archived here.
+        # They stay in dynamic/ and decay naturally until score < threshold.
+        # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
         domain = post.get("domain", ["未分类"])
         if kwargs.get("pinned") and post.get("type") != "permanent":
             post["type"] = "permanent"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
-        elif kwargs.get("resolved") and post.get("type") not in ("permanent", "feel"):
-            post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.archive_dir, domain)
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -522,12 +524,14 @@ class BucketManager:
                 weight_sum = self.w_topic + self.w_emotion + self.w_time + self.w_importance
                 normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
 
-                # Resolved buckets get ranking penalty (but still reachable by keyword)
-                # 已解决的桶降权排序（但仍可被关键词激活）
-                if meta.get("resolved", False):
-                    normalized *= 0.3
-
+                # Threshold check uses raw (pre-penalty) score so resolved buckets
+                # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
+                # remain reachable by keyword (penalty applied only to ranking).
                 if normalized >= self.fuzzy_threshold:
+                    # Resolved buckets get ranking penalty (but still reachable by keyword)
+                    # 已解决的桶仅在排序时降权
+                    if meta.get("resolved", False):
+                        normalized *= 0.3
                     bucket["score"] = round(normalized, 2)
                     scored.append(bucket)
             except Exception as e:
@@ -613,7 +617,7 @@ class BucketManager:
             days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
         except (ValueError, TypeError):
             days = 30
-        return math.exp(-0.1 * days)
+        return math.exp(-0.02 * days)
 
     # ---------------------------------------------------------
     # List all buckets
