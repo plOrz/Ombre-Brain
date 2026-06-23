@@ -18,6 +18,7 @@ from . import tunnel
 from . import oauth
 from . import dashboard
 from . import system
+from . import meta
 
 
 def register_all(mcp) -> None:
@@ -27,3 +28,4 @@ def register_all(mcp) -> None:
     oauth.register(mcp)
     dashboard.register(mcp)
     system.register(mcp)
+    meta.register(mcp)
