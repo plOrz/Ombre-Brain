@@ -278,9 +278,8 @@ def register(mcp) -> None:
 
         # --- 写回 config.yaml（iter 2.0 §10 U-03 修复：重启后设置不丢失）---
         try:
-            _cfg_path = os.path.join(
-                sh.repo_root, "config.yaml"
-            )
+            from utils import config_file_path
+            _cfg_path = config_file_path()
             _disk: dict[str, object] = {}
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, "r", encoding="utf-8") as _f:
@@ -330,9 +329,8 @@ def register(mcp) -> None:
         sh.config["human"] = human
         # 写回 config.yaml
         try:
-            _cfg_path = os.path.join(
-                sh.repo_root, "config.yaml"
-            )
+            from utils import config_file_path
+            _cfg_path = config_file_path()
             _disk2: dict[str, object] = {}
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, "r", encoding="utf-8") as _f:
